@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.express as px
 import yfinance as yf
 from fredapi import Fred
+from google import genai
+from google.genai import types
 
 
 # 頁面基本配置
@@ -21,6 +23,7 @@ else:
 
 if st.sidebar.button("手動刷新數據"):
     st.cache_data.clear()
+    st.session_state.pop("ai_macro_summary", None)
 
 
 # 1. 抓取 FRED 數據（快取 1 小時）
@@ -36,7 +39,33 @@ def get_fred_data(api_key):
         "日本10年期國債殖利率": fred.get_series("IRLTLT01JPM156N"),
     }
 
-    df = pd.DataFrame(data).sort_index()
+    raw_df = pd.DataFrame(data).sort_index()
+
+    # 保留尚未補值的原始觀測日期，供 AI 摘要準確標示資料時間。
+    latest_points = {}
+    for name in (
+        "CPI 物價指數",
+        "美國失業率",
+        "10年期美債殖利率",
+        "2年期美債殖利率",
+        "聯邦基金利率",
+    ):
+        observations = raw_df[name].dropna()
+        if not observations.empty:
+            latest_points[name] = {
+                "value": float(observations.iloc[-1]),
+                "date": observations.index[-1].strftime("%Y-%m-%d"),
+            }
+
+    paired_yields = raw_df[["10年期美債殖利率", "2年期美債殖利率"]].dropna()
+    if not paired_yields.empty:
+        latest_pair = paired_yields.iloc[-1]
+        latest_points["10Y-2Y美債殖利率利差"] = {
+            "value": float(latest_pair.iloc[0] - latest_pair.iloc[1]),
+            "date": paired_yields.index[-1].strftime("%Y-%m-%d"),
+        }
+
+    df = raw_df
 
     # 在相同觀測日期計算利差，避免跨日期拼接造成不準確。
     # DGS10 和 DGS2 的單位均為百分比，相減後單位為「百分點」。
@@ -51,7 +80,7 @@ def get_fred_data(api_key):
 
     # 原版 .tail(365) 是 365 筆觀測值；這裡改為真正的最近一年。
     one_year_ago = pd.Timestamp.today().normalize() - pd.DateOffset(years=1)
-    return df.loc[df.index >= one_year_ago]
+    return df.loc[df.index >= one_year_ago], latest_points
 
 
 # 2. 抓取金融市場數據（快取 10 分鐘）
@@ -69,10 +98,63 @@ def get_market_data():
     return df
 
 
+def generate_macro_summary(api_key, latest_points):
+    """以已下載的 FRED 最新值請 Gemini 產生約 200 字的繁體中文短評。"""
+    labels_and_units = {
+        "CPI 物價指數": "指數點（不是通膨年增率）",
+        "美國失業率": "%",
+        "10年期美債殖利率": "%",
+        "2年期美債殖利率": "%",
+        "聯邦基金利率": "%",
+    }
+    required = set(labels_and_units)
+    missing = required.difference(latest_points)
+    if missing:
+        raise ValueError(f"FRED 缺少資料：{', '.join(sorted(missing))}")
+
+    lines = []
+    for name, unit in labels_and_units.items():
+        item = latest_points[name]
+        lines.append(f"- {name}：{item['value']:.2f} {unit}（觀測日期 {item['date']}）")
+
+    if "10Y-2Y美債殖利率利差" in latest_points:
+        item = latest_points["10Y-2Y美債殖利率利差"]
+        lines.append(
+            f"- 10Y－2Y 利差：{item['value']:+.2f} 個百分點"
+            f"（同日觀測：{item['date']}）"
+        )
+
+    prompt = "\n".join([
+        "你是一位中立、嚴謹的總體經濟分析師。",
+        "請只根據下列 FRED 美國經濟指標，撰寫約 200 字（180～220 個繁體中文字）的總體經濟短評。",
+        "使用臺灣繁體中文，文字自然、客觀、適合大學生的課堂簡報。",
+        "要簡要解讀物價、就業、政策利率及長短期殖利率利差的意義。",
+        "CPI 是物價指數水準，不得直接把它當作年增率。",
+        "不同指標觀測日期不同，不能宣稱它們是同一天的即時報價。",
+        "沒有提供前期比較值，不要聲稱指標升降或經濟已進入衰退。",
+        "不臆測未提供的數據、不給個股或買賣投資建議。",
+        "只輸出一段短評，不要標題、條列、Markdown 或資料來源清單。",
+        "",
+        "最新可用資料：",
+        *lines,
+    ])
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt,
+        config=types.GenerateContentConfig(max_output_tokens=1200),
+    )
+    summary = (response.text or "").strip()
+    if not summary:
+        raise RuntimeError("模型沒有回傳可顯示的文字")
+    return summary
+
+
 # 頁面渲染邏輯
 if fred_key:
     try:
-        macro_df = get_fred_data(fred_key)
+        macro_df, latest_points = get_fred_data(fred_key)
         market_df = get_market_data()
 
         # 第一區塊：原本的四張核心 KPI 卡片
@@ -163,8 +245,35 @@ if fred_key:
             if macro_choice == "日本10年期國債殖利率":
                 st.caption("日本國債殖利率為月資料，圖表會沿用最近公布的月值。")
 
+        # 第四區塊：按一下才呼叫 Gemini，避免每次重新整理都產生費用。
+        st.write("---")
+        st.subheader("🤖 AI 總體經濟摘要")
+        st.caption("使用已抓取的 FRED 最新 CPI、失業率及利率資料生成約 200 字短評。")
+
+        if st.button("產生 AI 總體經濟摘要", type="primary", use_container_width=True):
+            st.session_state.pop("ai_macro_summary", None)
+            gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+            if not gemini_key:
+                st.warning("尚未設定 GEMINI_API_KEY。請至 Streamlit App Settings → Secrets 新增金鑰。")
+            else:
+                with st.spinner("AI 正在分析最新總體經濟數據…"):
+                    try:
+                        st.session_state["ai_macro_summary"] = generate_macro_summary(
+                            gemini_key, latest_points
+                        )
+                    except Exception as exc:
+                        st.error(
+                            f"摘要產生失敗（{type(exc).__name__}）。"
+                            "請確認 API Key、模型權限與使用額度後重試。"
+                        )
+
+        if st.session_state.get("ai_macro_summary"):
+            with st.container(border=True):
+                st.markdown("#### 📝 AI 總體經濟短評")
+                st.write(st.session_state["ai_macro_summary"])
+                st.caption("由 Gemini 根據 FRED 指標自動生成，僅供學術討論，請自行核對。")
+
     except Exception as e:
         st.error(f"數據讀取失敗，請確認 FRED API Key 是否正確。錯誤訊息: {e}")
 else:
     st.info("👈 請在左側輸入您的 FRED API Key 以開啟儀表板。")
-
