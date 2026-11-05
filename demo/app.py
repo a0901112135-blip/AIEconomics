@@ -25,12 +25,15 @@ if st.sidebar.button("手動刷新數據"):
 @st.cache_data(ttl=3600)
 def get_fred_data(api_key):
     fred = Fred(api_key=api_key)
+
     data = {
         "CPI 物價指數": fred.get_series("CPIAUCSL"),
         "10年期美債殖利率": fred.get_series("DGS10"),
         "美國失業率": fred.get_series("UNRATE"),
-        "聯邦基金利率": fred.get_series("FEDFUNDS")
+        "聯邦基金利率": fred.get_series("FEDFUNDS"),
+        "日本10年期國債殖利率": fred.get_series("IRLTLT01JPM156N")
     }
+
     df = pd.DataFrame(data).ffill().tail(365)
     return df
 
@@ -41,10 +44,20 @@ def get_market_data():
         "S&P 500": "^GSPC",
         "台灣加權指數": "^TWII",
         "布蘭特原油": "BZ=F",
-        "美元/台幣匯率": "TWD=X"
+        "美元/台幣匯率": "TWD=X",
+        "黃金期貨價格": "GC=F"
     }
-    df = yf.download(list(tickers.values()), period="1y")["Close"]
-    df.rename(columns={v: k for k, v in tickers.items()}, inplace=True)
+
+    df = yf.download(
+        list(tickers.values()),
+        period="1y"
+    )["Close"]
+
+    df.rename(
+        columns={v: k for k, v in tickers.items()},
+        inplace=True
+    )
+
     return df
 
 # 頁面渲染邏輯
